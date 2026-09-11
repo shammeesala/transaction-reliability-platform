@@ -3,6 +3,11 @@ __pycache__/
 *.py[cod]
 *$py.class
 
+# Packaging and distribution
+*.egg-info/
+build/
+dist/
+
 # Virtual environments
 .venv/
 venv/
@@ -22,5 +27,6 @@ htmlcov/
 
 # Operating System and IDEs
 .DS_Store
+__MACOSX/
 .vscode/
 .idea/
