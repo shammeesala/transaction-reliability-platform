@@ -1,14 +1,16 @@
 # Transaction Reliability and Event Processing Platform
 
-A production-style reference implementation exploring reliability and data-protection patterns common to event-driven transaction systems. It demonstrates idempotent request processing, sensitive-data tokenization boundaries, transactional state integrity, and failure recovery under downstream network ambiguity.
+A production-style reference implementation exploring reliability and data-protection patterns common to event-driven transaction systems. It demonstrates idempotent request processing, token-only payment boundaries, transactional state integrity, and recovery from ambiguous downstream outcomes.
 
 ---
 
 ## 1. The Problem
 
-In financial and mission-critical transactional systems (e.g., payments, reservations, order checkouts), transient network timeouts and client-side retries frequently cause duplicate submissions. 
+In financial and mission-critical transactional systems (e.g., payments, reservations, order checkouts), transient network timeouts and client-side retries frequently cause duplicate submissions.
 
-When a downstream payment network or external service takes longer to respond than the client's HTTP timeout, the client assumes the request failed and immediately retries. If the backend cannot guarantee atomic idempotency and concurrency serialization, the customer can be charged twice, or the system can enter an irrecoverable split-brain state.
+When a downstream payment network or external service takes longer to respond than the client's HTTP timeout, the client assumes the request failed and immediately retries. If the backend cannot guarantee atomic idempotency and concurrency serialization, the customer can be charged twice, or the platform can develop inconsistent transaction records and ambiguous downstream outcomes.
+
+Crucially, **a downstream timeout or connection drop must not automatically mark a transaction as `FAILED`**. If an external network processed the authorization but the response packet was dropped in transit, marking the transaction `FAILED` would allow an unsafe retry that creates a duplicate charge. The platform must explicitly model ambiguous external outcomes via a `PENDING_RECONCILIATION` state.
 
 ---
 
@@ -30,12 +32,12 @@ Version 0.1 focuses strictly on core transactional correctness, idempotency unde
 
 ## 3. Version 0.1 Guarantees
 
-* **Idempotent Replay**: Replaying the exact same idempotency key and payload returns the cached result (`Idempotent-Replay: true`).
+* **Idempotent Replay**: Replaying the exact same idempotency key and payload returns the cached result (`Idempotent-Replay: true`). Idempotency records cache declined business outcomes as well as approvals.
 * **Payload Mismatch Conflict**: Submitting an existing idempotency key with a different request body returns `HTTP 409 Conflict`.
 * **Concurrent Duplicate Protection**: Simultaneous requests using the same key create only one transaction; duplicate in-flight calls are serialized or rejected cleanly.
 * **Domain State Machine Integrity**: Invalid lifecycle transitions are strictly rejected.
-* **Synthetic Token Whitelist**: Only deterministic synthetic test tokens (`tok_test_*`) are accepted.
-* **Zero CVV Persistence**: CVV is validated transiently in-memory and immediately discarded—never persisted to database tables, disk, logs, or error traces.
+* **Ambiguous Outcome Isolation**: Downstream timeouts and disconnects transition transactions to `PENDING_RECONCILIATION`, preventing unsafe automatic retries until the true network state is determined.
+* **Token-Only Boundary**: The API accepts only predefined synthetic payment tokens (`tok_test_*`). PAN, CVV, and real cardholder data are rejected and never processed, persisted, or logged.
 
 ---
 
@@ -61,27 +63,39 @@ stateDiagram-v2
     [*] --> CREATED: Request Received
     CREATED --> AUTHORIZED: Network 200 (tok_test_approved)
     CREATED --> DECLINED: Network 402 (tok_test_declined)
-    CREATED --> FAILED: Network Timeout / Malformed / Disconnect
+    CREATED --> PENDING_RECONCILIATION: Network Timeout / Disconnect
+    CREATED --> FAILED: Confirmed Pre-Processing Failure / Malformed
+    
+    PENDING_RECONCILIATION --> AUTHORIZED: Reconciled as Approved
+    PENDING_RECONCILIATION --> DECLINED: Reconciled as Declined
+    PENDING_RECONCILIATION --> FAILED: Reconciled as Unprocessed / Voided
+    
     AUTHORIZED --> CAPTURED: Capture Request
     CAPTURED --> REFUNDED: Refund Request
+    
     DECLINED --> [*]
     FAILED --> [*]
     REFUNDED --> [*]
 ```
 
-All other transitions (e.g., attempting to refund an uncaptured transaction, or capturing a declined authorization) are illegal and rejected with domain errors.
+All other transitions (e.g., attempting to refund an uncaptured transaction, or capturing a declined authorization) are illegal and rejected with typed domain exceptions.
 
 ---
 
-## 6. Expected Failure Behavior
+## 6. Expected Failure Behavior & Response Contract
 
-| Synthetic Token | Downstream Emulator Behavior | API Service Response | Transaction State |
+We adopt a **transport-oriented API contract** (distinguishing successful API ingestion from a negative business outcome like a card decline):
+
+| Synthetic Token | Downstream Emulator Behavior | API Response | State |
 | :--- | :--- | :--- | :--- |
-| `tok_test_approved` | Returns `200 OK` | `201 Created` | `AUTHORIZED` |
-| `tok_test_declined` | Returns `402 Payment Required` | `402 Payment Required` | `DECLINED` |
-| `tok_test_timeout` | Socket / Read timeout | `504 Gateway Timeout` | `FAILED` |
-| `tok_test_rate_limited` | Returns `429 Too Many Requests` | `502 Bad Gateway` (Rate Limited) | `FAILED` |
-| `tok_test_disconnect` | Drops connection after processing | `502 Bad Gateway` (Connection Dropped) | `FAILED` (Pending Reconciliation) |
+| `tok_test_approved` | Returns `200 OK` (Auth successful) | `201 Created` (`status: AUTHORIZED`) | `AUTHORIZED` |
+| `tok_test_declined` | Returns `402 Payment Required` (Insufficient funds) | `201 Created` (`status: DECLINED`) | `DECLINED` |
+| `tok_test_timeout` | Socket / Read timeout (Result unknown) | `504 Gateway Timeout` | `PENDING_RECONCILIATION` |
+| `tok_test_disconnect` | Processes auth and drops connection | `502 Bad Gateway` | `PENDING_RECONCILIATION` |
+| `tok_test_rate_limited` | Returns `429 Too Many Requests` (Upstream throttled) | `503 Service Unavailable` | `FAILED` |
+| `tok_test_malformed` | Returns invalid / unparseable payload | `502 Bad Gateway` | `FAILED` |
+
+*Note: In `PENDING_RECONCILIATION`, the transaction record is safely preserved with its idempotency key. Subsequent retries using the same idempotency key will acknowledge the in-flight reconciliation rather than spawning a duplicate charge.*
 
 ---
 
