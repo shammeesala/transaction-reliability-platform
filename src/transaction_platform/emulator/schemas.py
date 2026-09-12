@@ -5,24 +5,18 @@ from typing import Any, Literal
 
 from pydantic import BaseModel, ConfigDict, ValidationInfo, field_validator
 
+from transaction_platform.common.problem_details import InvalidParameter, ProblemDetail
+
+__all__ = [
+    "AuthorizationRequest",
+    "AuthorizedResponse",
+    "CURRENCY_FORMAT_REGEX",
+    "DeclinedResponse",
+    "InvalidParameter",
+    "ProblemDetail",
+]
+
 CURRENCY_FORMAT_REGEX = re.compile(r"^[A-Z]{3}$")
-
-
-class InvalidParameter(BaseModel):
-    """RFC 7807 field-level invalid parameter description."""
-
-    field: str
-    reason: str
-
-
-class ProblemDetail(BaseModel):
-    """RFC 7807 problem details object."""
-
-    type: str
-    title: str
-    status: int
-    detail: str
-    invalid_parameters: list[InvalidParameter] | None = None
 
 
 class AuthorizationRequest(BaseModel):

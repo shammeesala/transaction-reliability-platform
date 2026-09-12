@@ -1,11 +1,12 @@
-"""Domain errors and RFC 7807 exception handlers for the emulator."""
-
+"""RFC 7807 problem details exception handlers for the transaction API."""
 
 from fastapi import Request
 from fastapi.exceptions import RequestValidationError
 from starlette.responses import Response
 
-from transaction_platform.common.correlation import CORRELATION_ID_REGEX
+from transaction_platform.application.authorize_transaction import (
+    DownstreamRateLimitExceededError,
+)
 from transaction_platform.common.problem_details import (
     InvalidParameter,
     build_problem_response,
@@ -13,32 +14,40 @@ from transaction_platform.common.problem_details import (
 )
 
 __all__ = [
-    "CORRELATION_ID_REGEX",
-    "EmulatorError",
-    "MissingCorrelationIdError",
-    "RateLimitedError",
-    "UnsupportedTokenError",
+    "downstream_rejected_handler",
     "missing_correlation_id_handler",
-    "rate_limited_handler",
-    "unsupported_token_handler",
+    "rate_limit_exceeded_handler",
     "validation_exception_handler",
 ]
 
 
-class EmulatorError(Exception):
-    """Base exception for payment network emulator errors."""
+async def rate_limit_exceeded_handler(
+    request: Request, exc: Exception
+) -> Response:
+    """Handle explicit downstream rate limiting with HTTP 503 and safe Retry-After."""
+    retry_after = 1
+    if isinstance(exc, DownstreamRateLimitExceededError):
+        retry_after = exc.retry_after
+
+    return build_problem_response(
+        status_code=503,
+        problem_type="urn:problem-type:provider-rate-limited",
+        title="Downstream rate limit exceeded",
+        detail="Downstream payment network rate limit exceeded.",
+        headers={"Retry-After": str(retry_after)},
+    )
 
 
-class MissingCorrelationIdError(EmulatorError):
-    """Raised when X-Correlation-ID header is missing, blank, or invalid."""
-
-
-class UnsupportedTokenError(EmulatorError):
-    """Raised when a payment token is not supported by the emulator scenarios."""
-
-
-class RateLimitedError(EmulatorError):
-    """Raised when simulating downstream payment network rate limiting."""
+async def downstream_rejected_handler(
+    request: Request, exc: Exception
+) -> Response:
+    """Handle explicit downstream request rejection without echoing upstream details."""
+    return build_problem_response(
+        status_code=502,
+        problem_type="urn:problem-type:downstream-rejected",
+        title="Payment network request rejected",
+        detail="The payment network rejected the authorization request.",
+    )
 
 
 async def missing_correlation_id_handler(
@@ -53,31 +62,6 @@ async def missing_correlation_id_handler(
             "The X-Correlation-ID header is required and must match "
             "pattern [A-Za-z0-9._:-]+ up to 128 characters without whitespace."
         ),
-    )
-
-
-async def unsupported_token_handler(
-    request: Request, exc: Exception
-) -> Response:
-    """Handle unsupported payment tokens without echoing the rejected token."""
-    return build_problem_response(
-        status_code=422,
-        problem_type="urn:problem-type:unsupported-token",
-        title="Unsupported payment token",
-        detail="The provided payment token is not supported by the payment network emulator.",
-    )
-
-
-async def rate_limited_handler(
-    request: Request, exc: Exception
-) -> Response:
-    """Handle simulated rate limiting."""
-    return build_problem_response(
-        status_code=429,
-        problem_type="urn:problem-type:rate-limited",
-        title="Rate limit exceeded",
-        detail="Payment network emulator simulated rate limit.",
-        headers={"Retry-After": "1"},
     )
 
 
