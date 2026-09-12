@@ -1,104 +1,166 @@
-# Transaction Reliability and Event Processing Platform
+# Transaction Reliability Platform
 
-A production-style reference implementation exploring reliability and data-protection patterns common to event-driven transaction systems. It demonstrates idempotent request processing, token-only payment boundaries, transactional state integrity, and recovery from ambiguous downstream outcomes.
+A small educational and reference implementation demonstrating reliable payment-authorization orchestration, explicit ambiguous-outcome handling, and strict domain state integrity under external network failures.
 
----
-
-## 1. The Problem
-
-In financial and mission-critical transactional systems (e.g., payments, reservations, order checkouts), transient network timeouts and client-side retries frequently cause duplicate submissions.
-
-When a downstream payment network or external service takes longer to respond than the client's HTTP timeout, the client assumes the request failed and immediately retries. If the backend cannot guarantee atomic idempotency and concurrency serialization, the customer can be charged twice, or the platform can develop inconsistent transaction records and ambiguous downstream outcomes.
-
-Crucially, **a downstream timeout or connection drop must not automatically mark a transaction as `FAILED`**. If an external network processed the authorization but the response packet was dropped in transit, marking the transaction `FAILED` would allow an unsafe retry that creates a duplicate charge. The platform must explicitly model ambiguous external outcomes via a `PENDING_RECONCILIATION` state.
+This project is an architectural reference exploring how distributed systems handle network timeouts, non-deterministic transport failures, and provider boundaries. It is **not** production-ready, PCI-DSS compliant, or fully event-driven.
 
 ---
 
-## 2. System Boundary (Version 0.1 Scope)
+## Current Architecture
 
-Version 0.1 focuses strictly on core transactional correctness, idempotency under concurrent retries, and network failure emulation:
+The platform follows a ports-and-adapters (hexagonal) architecture separating HTTP transport boundaries from core business logic:
 
-```
-[ Client / API Consumer ]
-            │
-            ▼ (HTTPS + Idempotency-Key + Correlation-ID)
-[ FastAPI Transaction Service ] ◄──► [ PostgreSQL ]
-            │
-            ▼ (HTTP / Internal Protocol)
-[ Payment Network Emulator ]
+```mermaid
+flowchart TD
+    Consumer["API Consumer"] -->|"POST /v1/transactions\n(X-Correlation-ID)"| API["FastAPI Transaction API\n(:8000)"]
+    API -->|"AuthorizeTransactionCommand"| Service["Authorization Application Service"]
+    Service -->|"Enforces transitions\n(version tracking)"| Domain["Transaction Domain State Machine"]
+    Service -->|"Invokes port"| Port["PaymentNetworkPort\n(Protocol)"]
+    Port -.->|"Implemented by"| Adapter["HttpPaymentNetworkAdapter\n(HTTPX AsyncClient)"]
+    Adapter -->|"POST /v1/authorizations\n(X-Correlation-ID)"| Emulator["Payment Network Emulator\n(:8001)"]
 ```
 
 ---
 
-## 3. Version 0.1 Guarantees
+## Implemented Features
 
-* **Idempotent Replay**: Replaying the exact same idempotency key and payload returns the cached result (`Idempotent-Replay: true`). Idempotency records cache declined business outcomes as well as approvals.
-* **Payload Mismatch Conflict**: Submitting an existing idempotency key with a different request body returns `HTTP 409 Conflict`.
-* **Concurrent Duplicate Protection**: Simultaneous requests using the same key create only one transaction; duplicate in-flight calls are serialized or rejected cleanly.
-* **Domain State Machine Integrity**: Invalid lifecycle transitions are strictly rejected.
-* **Ambiguous Outcome Isolation**: Downstream timeouts and disconnects transition transactions to `PENDING_RECONCILIATION`, preventing unsafe automatic retries until the true network state is determined.
-* **Token-Only Boundary**: The API accepts only predefined synthetic payment tokens (`tok_test_*`). PAN, CVV, and real cardholder data are rejected and never processed, persisted, or logged.
-
----
-
-## 4. What is Deliberately Excluded from Version 0.1
-
-To maintain a disciplined, auditable release boundary, the following are intentionally deferred to future milestones:
-* **Real Payment Processing**: No connection to live banking or card networks.
-* **PCI-DSS Compliance**: Demonstrates architectural boundaries, not production vault key management or HSMs.
-* **Production Key Management**: Cryptographic keys are loaded from local environment configurations for development.
-* **Exactly-Once Delivery**: The system relies on eventual at-least-once semantics paired with idempotent consumers.
-* **Asynchronous Outbox & Kafka**: Deferred to Version 0.2.
-* **Observability Dashboards (Prometheus/Grafana)**: Deferred to Version 0.3.
-* **AI-Assisted Test Scenario Generation**: Deferred to Version 0.4.
+* **Framework-Independent Transaction State Machine**: Pure standard-library domain entity enforcing discrete states (`CREATED`, `AUTHORIZED`, `DECLINED`, `CAPTURED`, `REFUNDED`, `PENDING_RECONCILIATION`, `FAILED`) and version tracking without database or framework dependencies.
+* **Explicit `PENDING_RECONCILIATION` State**: Pairs ambiguous outcomes with matching typed pending operations (`AUTHORIZATION`, `CAPTURE`, `REFUND`), making ambiguous outcomes explicit so a future persistence and idempotency layer can prevent unsafe retries.
+* **Typed Domain Exceptions & Invariants**: Enforces transition rules, terminal states, and non-empty identifier validations with typed domain errors.
+* **Deterministic Payment-Network Emulator**: Isolated FastAPI service simulating approved, declined, timed-out, malformed, and rate-limited gateway responses.
+* **FastAPI Transaction API**: Dedicated endpoint (`POST /v1/transactions`) orchestrating synthetic authorization requests with correlation-ID validation and propagation.
+* **Ports-and-Adapters Separation**: Application service orchestrates domain entities against an abstract `PaymentNetworkPort` protocol without coupling to HTTPX or network transports.
+* **Defensive HTTPX Secondary Adapter**: Translates downstream HTTP and transport outcomes into typed domain results without leaking client exceptions.
+* **Sanitized RFC 7807 Problem Details**: Maps validation, rate-limiting, downstream-rejection, and missing-header errors into structured problem responses without echoing sensitive fields or raw tokens.
+* **Synthetic Token-Only Boundary**: Accepts exclusively synthetic test tokens (`tok_test_*`); strictly rejects cardholder data (`pan`, `cvv`, `card_number`) and unknown fields.
+* **Defensive Failure Handling**: Handles timeouts, transport disconnects, malformed HTTP 200 responses, HTTP 408, HTTP 429, 4xx rejections, and 5xx upstream errors.
+* **Comprehensive Test Suite**: 276 passing automated tests covering state machine transitions, emulator contracts, adapter error mapping, and end-to-end in-process integration via `httpx.ASGITransport`.
+* **Strict Quality Gates**: Full verification under Ruff and strict Mypy (`mypy src`).
 
 ---
 
-## 5. Transaction Lifecycle
+## Scenario Handling & Response Contracts
 
-The transaction state machine governs the lifecycle of every transaction:
+The transaction service maps downstream outcomes into domain states and HTTP responses:
+
+| Token | Emulator response | Transaction API response | Domain state |
+| :--- | :--- | :--- | :--- |
+| `tok_test_approved` | HTTP 200 authorized result | HTTP 201 | `AUTHORIZED` |
+| `tok_test_declined` | HTTP 200 declined business result | HTTP 201 | `DECLINED` |
+| `tok_test_timeout` | Delayed successful response; client timeout makes the outcome ambiguous | HTTP 202 | `PENDING_RECONCILIATION` |
+| `tok_test_malformed` | HTTP 200 with deliberately invalid JSON | HTTP 202 | `PENDING_RECONCILIATION` |
+| `tok_test_rate_limited` | HTTP 429 with `Retry-After` | HTTP 503 | `FAILED` |
+
+### Key Failure Boundary Behaviors:
+* **Ambiguous Timeouts (HTTP 408 & Socket Timeouts)**: Upstream HTTP 408 and read/connect timeouts represent unknown outcomes; the transaction enters `PENDING_RECONCILIATION` (HTTP 202).
+* **Transport Errors & HTTP 5xx**: Network transport errors (`httpx.TransportError`) and server errors (HTTP 5xx) conservatively transition to `PENDING_RECONCILIATION` (HTTP 202).
+* **Explicit Provider Rejections (HTTP 4xx)**: Under the current emulator contract, non-408 and non-429 client errors (for example, 400 and 422) are treated as explicit request rejection; the transaction transitions to `FAILED` and returns HTTP 502 without exposing provider internals.
+* **Rate Limiting (HTTP 429)**: Under the emulator contract, HTTP 429 guarantees the request was rejected at the gateway before authorization processing began; the transaction transitions to `FAILED` and returns HTTP 503 with a sanitized `Retry-After` header.
+
+---
+
+## Transaction Lifecycle State Machine
 
 ```mermaid
 stateDiagram-v2
     [*] --> CREATED: Request Received
-    CREATED --> AUTHORIZED: Network 200 (tok_test_approved)
-    CREATED --> DECLINED: Network 402 (tok_test_declined)
-    CREATED --> PENDING_RECONCILIATION: Network Timeout / Disconnect
-    CREATED --> FAILED: Confirmed Pre-Processing Failure / Malformed
-    
+
+    CREATED --> AUTHORIZED: Confirmed Approval (HTTP 200)
+    CREATED --> DECLINED: Confirmed Decline (HTTP 200)
+    CREATED --> PENDING_RECONCILIATION: Timeout / HTTP 408 / Transport Error / 5xx / Malformed 200
+    CREATED --> FAILED: Provider Rejection (4xx) / Pre-processing Rate Limit (429)
+
     PENDING_RECONCILIATION --> AUTHORIZED: Reconciled as Approved
     PENDING_RECONCILIATION --> DECLINED: Reconciled as Declined
     PENDING_RECONCILIATION --> FAILED: Reconciled as Unprocessed / Voided
-    
-    AUTHORIZED --> CAPTURED: Capture Request
-    CAPTURED --> REFUNDED: Refund Request
-    
+
+    AUTHORIZED --> CAPTURED: Capture Operation
+    CAPTURED --> REFUNDED: Refund Operation
+
     DECLINED --> [*]
     FAILED --> [*]
     REFUNDED --> [*]
 ```
 
-All other transitions (e.g., attempting to refund an uncaptured transaction, or capturing a declined authorization) are illegal and rejected with typed domain exceptions.
+*Note: Capture and refund transitions are fully enforced in the domain entity; their external API endpoints will be added in subsequent milestones.*
 
 ---
 
-## 6. Expected Failure Behavior & Response Contract
+## Current Limitations
 
-We adopt a **transport-oriented API contract** (distinguishing successful API ingestion from a negative business outcome like a card decline):
-
-| Synthetic Token | Downstream Emulator Behavior | API Response | State |
-| :--- | :--- | :--- | :--- |
-| `tok_test_approved` | Returns `200 OK` (Auth successful) | `201 Created` (`status: AUTHORIZED`) | `AUTHORIZED` |
-| `tok_test_declined` | Returns `402 Payment Required` (Insufficient funds) | `201 Created` (`status: DECLINED`) | `DECLINED` |
-| `tok_test_timeout` | Socket / Read timeout (Result unknown) | `504 Gateway Timeout` | `PENDING_RECONCILIATION` |
-| `tok_test_disconnect` | Processes auth and drops connection | `502 Bad Gateway` | `PENDING_RECONCILIATION` |
-| `tok_test_rate_limited` | Returns `429 Too Many Requests` (Upstream throttled) | `503 Service Unavailable` | `FAILED` |
-| `tok_test_malformed` | Returns invalid / unparseable payload | `502 Bad Gateway` | `FAILED` |
-
-*Note: In `PENDING_RECONCILIATION`, the transaction record is safely preserved with its idempotency key. Subsequent retries using the same idempotency key will acknowledge the in-flight reconciliation rather than spawning a duplicate charge.*
+* **No Persistence**: Transactions exist only for the duration of a request and are discarded after the response; there is currently no transaction repository.
+* **No Idempotency-Key Storage**: Idempotency keys are not yet stored or enforced across duplicate requests.
+* **No Asynchronous Reconciliation**: Transactions in `PENDING_RECONCILIATION` cannot yet be polled or resolved out-of-band by a background worker.
+* **No Distributed Infrastructure**: No PostgreSQL, Kafka, transactional outbox, Redis, or Docker deployment.
+* **No Authentication**: Endpoints do not require API tokens or mTLS.
+* **Synthetic Data Only**: Accepts only `tok_test_*` synthetic tokens; no live payment processing or banking integration.
+* **No PCI-DSS Compliance Claim**: Demonstrates data-minimization boundaries but makes no formal PCI-DSS compliance claims.
 
 ---
 
-## 7. AI-Assisted Development
+## Planned Future Milestones
 
-AI coding tools were used for scaffolding, implementation suggestions, test-case generation, and code review. Architecture decisions, acceptance criteria, security boundaries, verification, and final code ownership remain with the project author. AI-generated changes are reviewed and validated through deterministic automated tests.
+1. **Durable Persistence & Idempotency**: PostgreSQL and SQLAlchemy persistence with atomic idempotency key reservations and payload validation.
+2. **Transactional Outbox & Event Publishing**: Reliable event streaming via Kafka for transaction status changes.
+3. **Asynchronous Reconciliation Worker**: Background daemon resolving `PENDING_RECONCILIATION` transactions via provider polling.
+4. **Capture & Refund API Endpoints**: Expanding API orchestration to post-authorization lifecycles.
+5. **Observability**: Structured metrics (Prometheus) and distributed tracing (OpenTelemetry).
+
+---
+
+## Developer Instructions
+
+### Prerequisites
+* Python 3.12+
+
+### 1. Environment Setup
+```bash
+# Create and activate a Python 3.12 virtual environment
+python3.12 -m venv .venv
+source .venv/bin/activate
+
+# Install package in editable mode with development dependencies
+python -m pip install -e ".[dev]"
+```
+
+### 2. Running the Services
+Start each service in a separate terminal:
+
+```bash
+# Terminal 1: Payment Network Emulator (:8001)
+uvicorn transaction_platform.emulator.app:app --port 8001
+
+# Terminal 2: Transaction API (:8000)
+uvicorn transaction_platform.api.app:app --port 8000
+```
+
+Service URLs and liveness health checks:
+* **Transaction API**: `http://localhost:8000` (Liveness: `http://localhost:8000/health/live`)
+* **Payment Network Emulator**: `http://localhost:8001` (Liveness: `http://localhost:8001/health/live`)
+
+### 3. Send a Sample Authorization Request
+```bash
+curl -i -X POST http://localhost:8000/v1/transactions \
+  -H "Content-Type: application/json" \
+  -H "X-Correlation-ID: corr_sample_001" \
+  -d '{
+    "transaction_id": "txn_sample_001",
+    "merchant_id": "merchant_101",
+    "payment_token": "tok_test_approved",
+    "amount": 2500,
+    "currency": "USD"
+  }'
+```
+
+### 4. Running Verification
+```bash
+pytest          # Run test suite (276 tests)
+ruff check .    # Run linting and style checks
+mypy src        # Run strict static type checks
+```
+
+---
+
+## AI Disclosure
+
+AI tools assisted with scaffolding, implementation suggestions, test generation, and review. Architecture decisions, acceptance criteria, validation, and code ownership remain with the author.
