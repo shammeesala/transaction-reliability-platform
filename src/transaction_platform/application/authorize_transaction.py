@@ -1,10 +1,11 @@
 """Application service for orchestrating transaction authorizations.
 
-Note on Persistence and In-Memory Lifecycle:
-Transactions in this milestone are strictly request-scoped and in-memory.
-They are not persisted to a database or cache. Pending transactions cannot
-actually be reconciled out-of-band until durable storage and the background
-reconciliation worker are introduced in subsequent milestones.
+Note on Persistence and Orchestration Architecture:
+The service itself remains persistence-agnostic, operating on domain entities and
+external payment network ports. The idempotent orchestrator now persists the initial
+and final transaction states through the idempotency coordinator, ensuring atomic
+reservation and completion boundaries. Automated out-of-band reconciliation of
+transactions in PENDING_RECONCILIATION remains future work.
 """
 
 from dataclasses import dataclass
