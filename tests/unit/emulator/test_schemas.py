@@ -223,4 +223,3 @@ class TestEmulatorSettingsValidation:
     def test_non_finite_timeout_delay_rejected(self, non_finite_delay: float) -> None:
         with pytest.raises(ValidationError):
             EmulatorSettings(timeout_delay_seconds=non_finite_delay)
-
