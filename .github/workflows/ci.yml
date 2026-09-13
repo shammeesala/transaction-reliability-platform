@@ -1,0 +1,57 @@
+name: CI
+
+on:
+  push:
+    branches: [ main, feature/* ]
+  pull_request:
+    branches: [ main ]
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_DB: transaction_platform
+          POSTGRES_USER: platform_user
+          POSTGRES_PASSWORD: platform_pass
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U platform_user -d transaction_platform"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 5
+
+    steps:
+      - uses: actions/checkout@v4
+      - name: Set up Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: "pip"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -e ".[dev]"
+
+      - name: Run Ruff
+        run: ruff check .
+
+      - name: Run Mypy
+        run: mypy src
+
+      - name: Run Alembic Migrations
+        env:
+          DATABASE_URL: postgresql+asyncpg://platform_user:platform_pass@localhost:5432/transaction_platform
+        run: alembic upgrade head
+
+      - name: Run Pytest
+        env:
+          DATABASE_URL: postgresql+asyncpg://platform_user:platform_pass@localhost:5432/transaction_platform
+        run: pytest
+
+      - name: Check Git Diff
+        run: git show --check --format= HEAD

@@ -16,6 +16,8 @@ from transaction_platform.common.problem_details import (
 __all__ = [
     "downstream_rejected_handler",
     "missing_correlation_id_handler",
+    "missing_idempotency_key_handler",
+    "persistence_error_handler",
     "rate_limit_exceeded_handler",
     "validation_exception_handler",
 ]
@@ -62,6 +64,36 @@ async def missing_correlation_id_handler(
             "The X-Correlation-ID header is required and must match "
             "pattern [A-Za-z0-9._:-]+ up to 128 characters without whitespace."
         ),
+    )
+
+
+async def missing_idempotency_key_handler(
+    request: Request, exc: Exception
+) -> Response:
+    """Handle missing or malformed Idempotency-Key headers."""
+    return build_problem_response(
+        status_code=400,
+        problem_type="urn:problem-type:missing-idempotency-key",
+        title="Missing or invalid idempotency key",
+        detail=(
+            "The Idempotency-Key header is required and must match "
+            "pattern [A-Za-z0-9._:-]+ up to 128 characters without whitespace."
+        ),
+    )
+
+
+async def persistence_error_handler(
+    request: Request, exc: Exception
+) -> Response:
+    """Handle unexpected persistence or concurrency failures with a sanitized RFC 7807 500 response.
+
+    Strictly forbids exposing SQL queries, table/constraint names, hashes, or driver internals.
+    """
+    return build_problem_response(
+        status_code=500,
+        problem_type="urn:problem-type:internal-persistence-error",
+        title="Internal Server Error",
+        detail="A persistence error occurred while processing the transaction.",
     )
 
 

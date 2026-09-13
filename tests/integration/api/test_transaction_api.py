@@ -7,6 +7,7 @@ from typing import Any
 import pytest
 from fastapi import FastAPI
 from httpx import ASGITransport, AsyncClient, MockTransport, Request, Response
+from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from transaction_platform.api.app import create_app as create_transaction_app
 from transaction_platform.common.problem_details import PROBLEM_MEDIA_TYPE
@@ -40,6 +41,15 @@ class ApiClientAdapter:
         return self._request("GET", url, **kwargs)
 
     def post(self, url: str, **kwargs: Any) -> Response:
+        if url == "/v1/transactions":
+            headers = dict(kwargs.get("headers") or {})
+            if "Idempotency-Key" not in headers:
+                json_data = kwargs.get("json")
+                if isinstance(json_data, dict) and "transaction_id" in json_data:
+                    headers["Idempotency-Key"] = f"idem_{json_data['transaction_id']}"
+                else:
+                    headers["Idempotency-Key"] = "idem_default_test_key"
+                kwargs["headers"] = headers
         return self._request("POST", url, **kwargs)
 
 
@@ -62,7 +72,9 @@ def emulator_app() -> FastAPI:
 
 
 @pytest.fixture
-def transaction_app(emulator_app: FastAPI) -> Iterator[FastAPI]:
+def transaction_app(
+    emulator_app: FastAPI, session_factory: async_sessionmaker[AsyncSession]
+) -> Iterator[FastAPI]:
     emulator_client = AsyncClient(
         transport=ASGITransport(app=emulator_app),
         base_url="http://emulator.test",
@@ -70,6 +82,7 @@ def transaction_app(emulator_app: FastAPI) -> Iterator[FastAPI]:
     app = create_transaction_app(
         http_client=emulator_client,
         emulator_base_url="http://emulator.test",
+        session_factory=session_factory,
     )
     yield app
     asyncio.run(emulator_client.aclose())
@@ -311,7 +324,7 @@ class TestEmulatorScenariosEndToEnd:
         assert "payment_token" not in data
 
     def test_timeout_scenario_returns_http_202_pending_reconciliation(
-        self, emulator_app: FastAPI
+        self, emulator_app: FastAPI, session_factory: async_sessionmaker[AsyncSession]
     ) -> None:
         # Create an adapter with a client timeout shorter than emulator sleep
         settings = EmulatorSettings(timeout_delay_seconds=0.2)
@@ -325,6 +338,7 @@ class TestEmulatorScenariosEndToEnd:
             http_client=emulator_client,
             emulator_base_url="http://emulator.test",
             network_timeout_seconds=0.02,
+            session_factory=session_factory,
         )
         local_client = ApiClientAdapter(app)
 
@@ -401,11 +415,15 @@ class TestDownstreamErrorsSanitization:
         "currency": "USD",
     }
 
-    def test_downstream_rejected_error_returns_http_502(self) -> None:
+    def test_downstream_rejected_error_returns_http_502(
+        self, session_factory: async_sessionmaker[AsyncSession]
+    ) -> None:
         failing_port = MockFailingPort(
             PaymentNetworkRejectedError("Internal provider validation error: bad secret")
         )
-        app = create_transaction_app(payment_network=failing_port)
+        app = create_transaction_app(
+            payment_network=failing_port, session_factory=session_factory
+        )
         client = ApiClientAdapter(app)
 
         response = client.post("/v1/transactions", json=self.VALID_BODY, headers=self.HEADERS)
@@ -419,11 +437,15 @@ class TestDownstreamErrorsSanitization:
         # Ensure internal provider rejection detail is NOT exposed
         assert "bad secret" not in response.text
 
-    def test_downstream_unavailable_error_returns_http_202(self) -> None:
+    def test_downstream_unavailable_error_returns_http_202(
+        self, session_factory: async_sessionmaker[AsyncSession]
+    ) -> None:
         failing_port = MockFailingPort(
             PaymentNetworkUnavailableError("Internal downstream gateway crash 500")
         )
-        app = create_transaction_app(payment_network=failing_port)
+        app = create_transaction_app(
+            payment_network=failing_port, session_factory=session_factory
+        )
         client = ApiClientAdapter(app)
 
         response = client.post("/v1/transactions", json=self.VALID_BODY, headers=self.HEADERS)
@@ -436,7 +458,9 @@ class TestDownstreamErrorsSanitization:
         assert data["version"] == 1
         assert data["pending_operation"] == "AUTHORIZATION"
 
-    def test_upstream_http_408_produces_http_202_pending_reconciliation(self) -> None:
+    def test_upstream_http_408_produces_http_202_pending_reconciliation(
+        self, session_factory: async_sessionmaker[AsyncSession]
+    ) -> None:
         def handler(request: Request) -> Response:
             return Response(status_code=408, content=b"Request Timeout")
 
@@ -444,7 +468,9 @@ class TestDownstreamErrorsSanitization:
             transport=MockTransport(handler), base_url="http://emulator.test"
         )
         app = create_transaction_app(
-            http_client=mock_client, emulator_base_url="http://emulator.test"
+            http_client=mock_client,
+            emulator_base_url="http://emulator.test",
+            session_factory=session_factory,
         )
         client = ApiClientAdapter(app)
 
